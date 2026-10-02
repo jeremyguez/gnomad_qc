@@ -2,6 +2,7 @@
 
 import logging
 import os
+from os import getenv
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import hail as hl
@@ -182,7 +183,7 @@ def _init_hail(
     if experimental and batch_id is None:
         # Default: pick up the outer batch's ID from HAIL_BATCH_ID
         # (set automatically by Hail Batch inside a batch job).
-        env_batch_id = os.getenv("HAIL_BATCH_ID")
+        env_batch_id = getenv("HAIL_BATCH_ID")
         if not env_batch_id:
             raise ValueError(
                 "experimental=True requires batch_id, or HAIL_BATCH_ID"
@@ -191,27 +192,25 @@ def _init_hail(
             )
         batch_id = int(env_batch_id)
 
-    if environment == "rwb":
-        log = f"/home/jupyter/workspaces/gnomadproduction/{log_name}.log"
-    elif environment == "batch":
-        log = f"/tmp/{log_name}.log"
-    else:
-        log = get_logging_path(
+    log = (
+        f"/home/jupyter/workspaces/gnomadproduction/{log_name}.log"
+        if environment == "rwb"
+        else get_logging_path(
             log_name, environment=environment, tmp_dir_days=tmp_dir_days
         )
+    )
     init_kwargs = {
         "log": log,
         "tmp_dir": qc_temp_prefix(environment=environment, days=tmp_dir_days),
         **{k: v for k, v in kwargs.items() if v is not None},
     }
     if environment == "batch":
-        os.environ["HAIL_BATCH_BILLING_PROJECT"] = (
-            billing_project or "gnomad-production"
-        )
         init_kwargs.update(
             {
                 "backend": "batch",
-                "gcs_requester_pays_configuration": "broad-mpg-gnomad",
+                "gcs_requester_pays_configuration": (
+                    billing_project or "broad-mpg-gnomad"
+                ),
                 "regions": ["us-central1"],
             }
         )

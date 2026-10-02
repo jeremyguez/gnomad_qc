@@ -1187,11 +1187,12 @@ def _initialize_hail(args: argparse.Namespace) -> None:
     :param args: Parsed CLI args.
     :return: None.
     """
+    # The Hail Batch billing project comes from the Hail config (the relay setup
+    # command writes it); --billing-project is for the relay jobs themselves.
     tmp = qc_temp_prefix(environment=args.environment, days=args.tmp_dir_days)
     _init_hail(
         "v5_frequency_generation",
         args.environment,
-        billing_project=args.billing_project,
         tmp_dir_days=args.tmp_dir_days,
         tmp_dir=f"{tmp}frequency_generation",
         **_get_batch_resource_kwargs(args),

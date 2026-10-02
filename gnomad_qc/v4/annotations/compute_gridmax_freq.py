@@ -233,6 +233,7 @@ def prep_vds_for_gridmax(
     ht: hl.Table,
     chrom: Optional[str] = None,
     test_gene: bool = False,
+    keep_pop: bool = False,
 ) -> hl.vds.VariantDataset:
     """
     Prep gnomAD v4 VDS for gridmax frequency computation.
@@ -244,6 +245,8 @@ def prep_vds_for_gridmax(
     :param ht: Table keyed by 's' with fields bin_id and eval_fold.
     :param chrom: Optional chromosome to restrict to (e.g. 'chr20').
     :param test_gene: If True, restrict to DRD2 for quick testing.
+    :param keep_pop: If True, keep the release genetic ancestry group ('pop') col
+        annotation from get_vds_for_freq.
     :return: Prepped VDS with bin_id and eval_fold col annotations, both folds included.
     """
     vds = get_vds_for_freq(test_gene=test_gene, chrom=chrom)
@@ -269,7 +272,10 @@ def prep_vds_for_gridmax(
     rmt = vds.reference_data
     vmt = vmt.annotate_cols(bin_id=ht[vmt.s].bin_id, eval_fold=ht[vmt.s].eval_fold)
     vmt = vmt.filter_cols(hl.is_defined(ht[vmt.s]))
-    vmt = vmt.select_cols("sex_karyotype", "fixed_homalt_model", "bin_id", "eval_fold")
+    col_fields = ["sex_karyotype", "fixed_homalt_model", "bin_id", "eval_fold"]
+    if keep_pop:
+        col_fields.append("pop")
+    vmt = vmt.select_cols(*col_fields)
     rmt = rmt.filter_cols(hl.is_defined(ht[rmt.s]))
     rmt = rmt.filter_rows(hl.agg.count() > 0)
 
@@ -297,6 +303,17 @@ def compute_pixel_freq(
     """
     logger.info("Densifying VDS for frequency computation...")
     mt = densify_and_prep_vds_for_freq(vds, ab_cutoff=ab_cutoff)
+    return aggregate_pixel_freq(mt)
+
+
+def aggregate_pixel_freq(mt: hl.MatrixTable) -> hl.Table:
+    """
+    Compute per-bin adj frequencies on an already densified MatrixTable.
+
+    :param mt: Dense MatrixTable from densify_and_prep_vds_for_freq, with GT, adj and
+        _high_ab_het_ref entries and bin_id, eval_fold and fixed_homalt_model cols.
+    :return: Table with freq, freq_eval, high_ab_hets, high_ab_hets_eval dicts keyed by bin_id.
+    """
     logger.info("Aggregating per-bin frequencies with group_by (both eval folds)...")
     high_ab_het_flag = mt.GT.is_het_ref() & ~mt.fixed_homalt_model & mt._high_ab_het_ref
     ht = mt.select_rows(

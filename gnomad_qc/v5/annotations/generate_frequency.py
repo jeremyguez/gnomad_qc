@@ -1003,7 +1003,14 @@ def _orchestrate_freq_fanout(args: argparse.Namespace, ht_path: str) -> None:
     )
     if not pending:
         return
-    setup_cmd, backend_kwargs, script = relay_context(args, "generate_frequency.py")
+    commit = resolve_commit()
+    setup_cmd, backend_kwargs, script = relay_context(
+        commit,
+        args.methods_branch,
+        args.billing_project,
+        args.batch_remote_tmpdir,
+        "generate_frequency.py",
+    )
     common = _relay_flags(args, chunk=True)
     scope = "region" if args.test_region else f"{len(pending)}of{n_total}c"
     batch_base = combine_suffix(
@@ -1051,7 +1058,7 @@ def _orchestrate_freq_fanout(args: argparse.Namespace, ht_path: str) -> None:
         failed,
         len(pending),
         new_run_id(),
-        resolve_commit(),
+        commit,
         args.app_name,
         waves,
     )
@@ -1132,7 +1139,13 @@ def _orchestrate_freq_merge(args: argparse.Namespace, ht_path: str) -> None:
             f"{len(missing)} of {len(eligible)} chunks are missing (first:"
             f" {missing[:5]}); rerun --use-batch-fanout first."
         )
-    setup_cmd, backend_kwargs, script = relay_context(args, "generate_frequency.py")
+    setup_cmd, backend_kwargs, script = relay_context(
+        resolve_commit(),
+        args.methods_branch,
+        args.billing_project,
+        args.batch_remote_tmpdir,
+        "generate_frequency.py",
+    )
     gs = args.merge_group_size
     orchestrate_tree_merge(
         inputs=[chunk_path(ht_path, i, intervals_hash) for i in eligible],

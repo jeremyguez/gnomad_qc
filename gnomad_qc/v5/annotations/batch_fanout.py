@@ -125,7 +125,13 @@ def build_setup_command(
 
 
 def relay_context(
-    args, script_name: str, hail_version: Optional[str] = None
+    commit: str,
+    methods_branch: str,
+    batch_billing_project: str,
+    batch_remote_tmpdir: Optional[str],
+    script_name: str,
+    gcp_billing_project: str = "broad-mpg-gnomad",
+    hail_version: Optional[str] = None,
 ) -> tuple[str, dict, str]:
     """
     Return what every relay submission needs: setup command, backend kwargs, script.
@@ -133,18 +139,22 @@ def relay_context(
     Built once per orchestrator so the fan-out and the merge cannot drift onto
     different commits or images.
 
-    :param args: Parsed CLI args (``methods_branch``, ``billing_project``,
-        ``batch_remote_tmpdir``).
+    :param commit: gnomad_qc commit the relays check out.
+    :param methods_branch: gnomad_methods branch or commit the relays check out.
+    :param batch_billing_project: Hail Batch billing project for the relay jobs.
+    :param batch_remote_tmpdir: ``hb.ServiceBackend`` scratch, or None for Hail's
+        configured one.
     :param script_name: Script file name under ``gnomad_qc/v5/annotations``.
+    :param gcp_billing_project: Requester-pays project for the relays.
     :param hail_version: Optional Hail pin for :func:`build_setup_command`.
     :return: ``(setup_cmd, backend_kwargs, script_command)``.
     """
     setup_cmd = build_setup_command(
-        resolve_commit(), methods_branch=args.methods_branch, hail_version=hail_version
+        commit, gcp_billing_project, methods_branch, hail_version
     )
-    backend_kwargs = {"billing_project": args.billing_project}
-    if args.batch_remote_tmpdir:
-        backend_kwargs["remote_tmpdir"] = args.batch_remote_tmpdir
+    backend_kwargs = {"billing_project": batch_billing_project}
+    if batch_remote_tmpdir:
+        backend_kwargs["remote_tmpdir"] = batch_remote_tmpdir
     script = f"python3 /tmp/gnomad_qc/gnomad_qc/v5/annotations/{script_name}"
     return setup_cmd, backend_kwargs, script
 
@@ -624,6 +634,7 @@ def orchestrate_tree_merge(
     merge_storage: str,
     final_merge_storage: str,
     submit: Callable[[str, list[RelayJobSpec], str], Optional[int]],
+    attempts: int = 1,
 ) -> None:
     """
     Union ``inputs`` into ``final_output_path`` with a tree of relay merge jobs.
@@ -649,6 +660,7 @@ def orchestrate_tree_merge(
     :param merge_storage: Storage per intermediate merge job.
     :param final_merge_storage: Storage for the final merge job.
     :param submit: ``(batch_name, job_specs, log_label) -> batch id``.
+    :param attempts: Batch attempts per merge job. Default 1.
     :return: None.
     """
     gs = merge_group_size
@@ -673,7 +685,7 @@ def orchestrate_tree_merge(
             cpu=merge_cpu,
             memory=merge_memory,
             storage=storage,
-            attempts=1,
+            attempts=attempts,
             command=(
                 f"{setup_cmd}{script} --run-merge --merge-output {output}{coalesce_flag}"
                 f" --merge-inputs {' '.join(group_inputs)} {common_flags}"

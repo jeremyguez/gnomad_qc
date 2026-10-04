@@ -677,8 +677,8 @@ def export_pooled_bin_parquet(pooled_ht: hl.Table, path: str) -> None:
     :param path: Output Parquet directory.
     """
     ht = pooled_ht.select(entry=pooled_ht.freq_pooled.items())
-    ht = ht.explode("entry")
-    ht = ht.key_by().select(
+    ht = ht.explode("entry").key_by()
+    ht = ht.select(
         chrom=ht.locus.contig,
         pos=ht.locus.position,
         ref=ht.alleles[0],

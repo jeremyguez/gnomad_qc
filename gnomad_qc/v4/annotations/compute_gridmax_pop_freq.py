@@ -62,6 +62,9 @@ logger.setLevel(logging.INFO)
 PUBLIC_EXOMES_RELEASE_HT = (
     "gs://gcp-public-data--gnomad/release/4.1/ht/exomes/gnomad.exomes.v4.1.sites.ht"
 )
+INTERNAL_EXOMES_FREQ_HT = (
+    "gs://gnomad/v4.1/annotations/exomes/gnomad.exomes.v4.1.frequencies.ht"
+)
 TEST_GENE_INTERVAL = "chr11:113409605-113475691"
 SAMPLE_SETS = {"train": [0], "eval": [1], "all": [0, 1]}
 ALL_GROUP = "all"
@@ -234,24 +237,7 @@ def compute_pop_freq(
         raw[ALL_GROUP] = _sum_raw(hl.array(list(raw.values())))
         raw_annotations[f"raw_{set_name}"] = hl.struct(**raw)
     ht = ht.annotate(**raw_annotations)
-
-    groups = pops + [ALL_GROUP]
-    ht = ht.annotate(
-        **{
-            f"freq_{set_name}": hl.bind(
-                lambda r: hl.struct(
-                    **{
-                        g: _corrected_call_stats(
-                            r[g], _af(r[ALL_GROUP].AC, r[ALL_GROUP].AN) > af_threshold
-                        )
-                        for g in groups
-                    }
-                ),
-                ht[f"raw_{set_name}"],
-            )
-            for set_name in SAMPLE_SETS
-        }
-    )
+    ht = _annotate_corrected_sets(ht, pops + [ALL_GROUP], af_threshold)
     if pooled_bins_direct:
         ht = ht.annotate(
             freq_pooled_direct=hl.dict(
@@ -267,6 +253,122 @@ def compute_pop_freq(
         "pop_fold_stats", *(["bin_stats_pooled_direct"] if pooled_bins_direct else [])
     )
     return ht.select_globals(af_threshold_for_correction=af_threshold, pops=pops)
+
+
+def _annotate_corrected_sets(
+    ht: hl.Table, groups: List[str], af_threshold: float
+) -> hl.Table:
+    """Add freq_{set} from raw_{set}, correcting every group when the set's site AF > af_threshold."""
+    return ht.annotate(
+        **{
+            f"freq_{set_name}": hl.bind(
+                lambda r: hl.struct(
+                    **{
+                        g: _corrected_call_stats(
+                            r[g], _af(r[ALL_GROUP].AC, r[ALL_GROUP].AN) > af_threshold
+                        )
+                        for g in groups
+                    }
+                ),
+                ht[f"raw_{set_name}"],
+            )
+            for set_name in SAMPLE_SETS
+        }
+    )
+
+
+def get_internal_raw_freq(
+    internal_ht: hl.Table, pops: List[str], intervals: Optional[list] = None
+) -> hl.Table:
+    """
+    Select uncorrected all-sample call stats per group from the internal release freq HT.
+
+    :param internal_ht: Internal exome freq HT with uncorrected `freq` and
+        `high_ab_hets_by_group` arrays (gnomad.exomes.v4.1.frequencies.ht).
+    :param pops: Genetic ancestry groups.
+    :param intervals: Optional intervals to restrict to.
+    :return: Table keyed by locus, alleles with an `internal_raw` struct (one field
+        per group plus 'all').
+    """
+    if intervals is not None:
+        internal_ht = hl.filter_intervals(internal_ht, intervals)
+    idx = _public_group_indices(hl.eval(internal_ht.freq_meta), pops)
+    missing = set(pops + [ALL_GROUP]) - set(idx)
+    if missing:
+        raise ValueError(f"Groups missing from the internal freq HT: {sorted(missing)}")
+    return internal_ht.select(
+        internal_raw=hl.struct(
+            **{
+                g: hl.struct(
+                    AC=internal_ht.freq[i].AC,
+                    AN=internal_ht.freq[i].AN,
+                    homozygote_count=internal_ht.freq[i].homozygote_count,
+                    n_high_ab_het=hl.int32(internal_ht.high_ab_hets_by_group[i]),
+                )
+                for g, i in idx.items()
+            }
+        )
+    )
+
+
+def compute_pop_freq_eval_subtract(
+    mt: hl.MatrixTable,
+    pops: List[str],
+    internal_raw_ht: hl.Table,
+    af_threshold: float = DEFAULT_AF_THRESHOLD,
+) -> hl.Table:
+    """
+    Compute per-group call stats from the eval fold only and derive train = all - eval.
+
+    `mt` must contain eval-fold samples only. All-sample raw stats come from the
+    internal release freq HT (validated equal to genotype-based all-sample stats).
+    Output has the same schema as compute_pop_freq (raw_{set} and freq_{set}).
+
+    :param mt: Dense MatrixTable of eval-fold exome samples (pop, fixed_homalt_model cols).
+    :param pops: Genetic ancestry groups to report.
+    :param internal_raw_ht: Output of get_internal_raw_freq.
+    :param af_threshold: Site AF above which the high-AB-het correction is applied.
+    :return: Table with raw_{set} and freq_{set} structs for train / eval / all.
+    """
+    high_ab_het_flag = mt.GT.is_het_ref() & ~mt.fixed_homalt_model & mt._high_ab_het_ref
+    stats_agg = hl.struct(
+        call_stats=hl.agg.call_stats(mt.GT, mt.alleles),
+        n_high_ab_het=hl.int32(hl.agg.count_where(high_ab_het_flag)),
+    )
+    logger.info("Aggregating per-pop call stats on the eval fold...")
+    ht = mt.select_rows(
+        pop_stats=hl.agg.filter(mt.adj, hl.agg.group_by(mt.pop, stats_agg))
+    ).rows()
+
+    raw_eval = {
+        pop: hl.coalesce(
+            hl.or_missing(
+                ht.pop_stats.contains(pop), _flatten_raw(ht.pop_stats.get(pop))
+            ),
+            _zero_raw(),
+        )
+        for pop in pops
+    }
+    raw_eval[ALL_GROUP] = _sum_raw(hl.array(list(raw_eval.values())))
+    groups = pops + [ALL_GROUP]
+    ht = ht.select(raw_eval=hl.struct(**raw_eval))
+    ht = ht.annotate(raw_all=internal_raw_ht[ht.key].internal_raw)
+    ht = ht.annotate(
+        raw_train=hl.struct(
+            **{
+                g: hl.struct(
+                    **{f: ht.raw_all[g][f] - ht.raw_eval[g][f] for f in RAW_FIELDS}
+                )
+                for g in groups
+            }
+        )
+    )
+    ht = _annotate_corrected_sets(ht, groups, af_threshold)
+    return ht.select_globals(
+        af_threshold_for_correction=af_threshold,
+        pops=pops,
+        method="eval_only_subtract",
+    )
 
 
 def pool_bin_folds(freq_ht: hl.Table, af_threshold: float) -> hl.expr.DictExpression:
@@ -448,6 +550,7 @@ def validate(
     agg = ht.aggregate(
         hl.struct(
             n_variants=hl.agg.count(),
+            n_missing_raw_all=hl.agg.count_where(hl.is_missing(ht.raw_all)),
             n_missing_in_bin_ht=hl.agg.count_where(hl.is_missing(ht.bins)),
             n_train_mismatch=hl.agg.count_where(
                 (tr_bins.AC != ht.raw_train[ALL_GROUP].AC)
@@ -566,6 +669,27 @@ def export_pooled_bin_tsv(pooled_ht: hl.Table, path: str) -> None:
     ht.export(path)
 
 
+def export_pooled_bin_parquet(pooled_ht: hl.Table, path: str) -> None:
+    """
+    Export Experiment 2 as a Parquet dataset (one row per variant and released bin).
+
+    :param pooled_ht: Output of --compute-pooled-bin-freq.
+    :param path: Output Parquet directory.
+    """
+    ht = pooled_ht.select(entry=pooled_ht.freq_pooled.items())
+    ht = ht.explode("entry")
+    ht = ht.key_by().select(
+        chrom=ht.locus.contig,
+        pos=ht.locus.position,
+        ref=ht.alleles[0],
+        alt=ht.alleles[1],
+        bin_id=ht.entry[0],
+        AC=ht.entry[1].AC,
+        AN=ht.entry[1].AN,
+    )
+    ht.to_spark().write.mode("overwrite").parquet(path)
+
+
 def main(args):
     """Run the GridMax companion frequency pipeline."""
     hl.init(log="/tmp/gridmax_pop_freq.log", tmp_dir=args.tmp_dir)
@@ -585,9 +709,15 @@ def main(args):
         "export",
     ]
     run_all = not any(getattr(args, s) for s in steps)
+    # The eval-only mode is a single pass (no split VDS / dense MT checkpoints).
+    single_pass_skipped = (
+        {"prep_vds", "densify", "compute_bin_freq"}
+        if args.eval_only_subtract
+        else set()
+    )
 
     def run(step):
-        return run_all or getattr(args, step)
+        return (run_all and step not in single_pass_skipped) or getattr(args, step)
 
     training_ht = get_gridmax_training_samples().ht()
     binned_exomes = training_ht.filter(
@@ -625,7 +755,22 @@ def main(args):
         ht = aggregate_pixel_freq(hl.read_matrix_table(paths["dense_mt"]))
         ht.checkpoint(paths["bin_freq"], overwrite=overwrite)
 
-    if run("compute_pop_freq"):
+    if run("compute_pop_freq") and args.eval_only_subtract:
+        logger.info("Step: per-pop call stats, eval fold only + subtraction...")
+        eval_ht = training_ht.filter(training_ht.eval_fold == 1)
+        vds = prep_vds_for_gridmax(
+            eval_ht, chrom=chrom, test_gene=test_gene, keep_pop=True
+        )
+        ht = compute_pop_freq_eval_subtract(
+            densify_split_vds(vds, args.ab_cutoff),
+            pops,
+            get_internal_raw_freq(
+                hl.read_table(args.internal_freq_ht), pops, intervals=intervals
+            ),
+            af_threshold=args.af_threshold,
+        )
+        ht.checkpoint(paths["pop_freq"], overwrite=overwrite)
+    elif run("compute_pop_freq"):
         logger.info("Step: per-pop call stats...")
         ht = compute_pop_freq(
             hl.read_matrix_table(paths["dense_mt"]),
@@ -670,9 +815,15 @@ def main(args):
         export_train_pop_tsv(
             hl.read_table(paths["pop_freq"]), pops, paths["train_pop_tsv"]
         )
-        export_pooled_bin_tsv(
-            hl.read_table(paths["pooled_bin_freq"]), paths["pooled_bin_tsv"]
-        )
+        if args.pooled_export_format == "parquet":
+            export_pooled_bin_parquet(
+                hl.read_table(paths["pooled_bin_freq"]),
+                paths["pooled_bin_tsv"].replace(".tsv.bgz", ".parquet"),
+            )
+        else:
+            export_pooled_bin_tsv(
+                hl.read_table(paths["pooled_bin_freq"]), paths["pooled_bin_tsv"]
+            )
         logger.info("Exports written to %s", args.output_dir)
 
 
@@ -749,6 +900,26 @@ if __name__ == "__main__":
         type=int,
         default=DEFAULT_MIN_BIN_OCCUPANCY,
         help=f"Privacy threshold for pooled bins (default: {DEFAULT_MIN_BIN_OCCUPANCY}).",
+    )
+    parser.add_argument(
+        "--eval-only-subtract",
+        action="store_true",
+        help=(
+            "Experiment 1 from the eval fold only: train = all-sample stats of "
+            "--internal-freq-ht minus eval-fold stats. Single pass, no split VDS or "
+            "dense MT checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--internal-freq-ht",
+        default=INTERNAL_EXOMES_FREQ_HT,
+        help=f"Internal freq HT with uncorrected freq + high_ab_hets_by_group (default: {INTERNAL_EXOMES_FREQ_HT}).",
+    )
+    parser.add_argument(
+        "--pooled-export-format",
+        choices=["tsv", "parquet"],
+        default="tsv",
+        help="Format of the Experiment 2 export (default: tsv).",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite outputs.")
 
